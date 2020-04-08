@@ -1,0 +1,1119 @@
+/* main.c - Application main entry point */
+
+#include <fieldsightlib.h>
+#include "board.h"
+#include "gsm_uart.h"
+#include "circular_buffer.h"
+#include "user_cfg.h"
+#include <stdlib.h>
+
+#define STACKSIZE 800
+#define PRIORITY 7
+#define BUTTON_DEBOUNCE_DELAY_MS 250
+
+static struct bt_mesh_model *mod_cli;
+static struct bt_mesh_model_pub *mod_pub;
+
+static struct gpio_callback button_cb;
+static struct device *sw_device;
+static u8_t button_busy[4];
+
+static volatile bool start_report_ack;
+static volatile bool stop_report_ack;
+static volatile bool filter_cmd_ack;
+//static u32_t time, last_time;
+static volatile bool nw_range_led_enable;
+ 
+void uart_send(u8_t *data, u8_t data_len);
+u8_t format_uart_in_string(char *buf, u8_t *data, u8_t data_len);
+
+static void button_pressed(struct device *dev, struct gpio_callback *cb, u32_t pin_pos);
+
+struct timestamp_record {
+	u16_t addr;
+	u32_t timestamp;
+};
+s32_t get_avail_ts_record(s32_t *index, struct timestamp_record *ts_record, struct bt_mesh_msg_ctx *ctx);
+
+struct timestamp_record node_ts_record[MAX_NODE_IN_MESH_NW];
+struct timestamp_record btscan_ts_record[MAX_NODE_IN_MESH_NW];
+//struct timestamp_record envi_ts_record[MAX_NODE_IN_MESH_NW];
+
+static u16_t addr;
+
+static void snd_cmd_thread(void);
+K_THREAD_DEFINE(snd_cmd_tid, 800, snd_cmd_thread, NULL, NULL, NULL, 7, 0, K_NO_WAIT);
+
+void uart_out_thread(void);
+K_THREAD_DEFINE(uart_out_tid, 256, uart_out_thread, NULL, NULL, NULL, 7, 0, K_NO_WAIT);
+void nw_range_led_thread(void);
+K_THREAD_DEFINE(nw_range_led_tid, 1024, nw_range_led_thread, NULL, NULL, NULL, 7, 0, K_NO_WAIT);
+
+
+static struct bt_mesh_cfg_cli cfg_cli = {
+};
+
+BT_MESH_MODEL_PUB_DEFINE(gen_onoff_pub_cli, NULL, 9/*max msg size*/ + 2/*opcode side*/);
+
+
+#define BTSCAN_REPORT_TYPE			0x00
+#define BTSCAN_REPORT_STATUS_TYPE		0x01
+#define BTSCAN_INTERVAL_STATUS_TYPE		0x02
+#define BTSCAN_FILTER_STATUS_TYPE		0x03
+#define ENVI_REPORT_TYPE			0x04
+#define ENVI_REPORT_STATUS_TYPE			0x05
+#define ENVI_INTERVAL_STATUS_TYPE		0x06
+#define NODE_SYSTEM_RESET_STATUS_TYPE		0x07
+#define NODE_SYSTEM_SHUTDOWN_STATUS_TYPE	0x08
+
+static void node_system_reset_status(struct bt_mesh_model *model,
+		struct bt_mesh_msg_ctx *ctx,
+		struct net_buf_simple *buf)
+{
+	u8_t uart_buf[2];
+	u8_t cnt = 0;
+
+	uart_buf[cnt++] = NODE_SYSTEM_RESET_STATUS_TYPE;
+	
+	printk("\n-->[0x%04x] ", ctx->addr);
+	printk("NODE_SYSTEM_RESET_ACK\n");
+
+	uart_send(uart_buf, cnt);
+}
+static void node_system_shutdown_status(struct bt_mesh_model *model,
+		struct bt_mesh_msg_ctx *ctx,
+		struct net_buf_simple *buf)
+{
+	u8_t uart_buf[2];
+	u8_t cnt = 0;
+
+	uart_buf[cnt++] = NODE_SYSTEM_SHUTDOWN_STATUS_TYPE;
+
+	printk("\n-->[0x%04x] ", ctx->addr);
+	printk("NODE_SYSTEM_SHUTDOWN_ACK\n");
+
+	uart_send(uart_buf, cnt);
+}
+
+static void envi_report(struct bt_mesh_model *model,
+		struct bt_mesh_msg_ctx *ctx,
+		struct net_buf_simple *buf)
+{
+      	u32_t timestamp = net_buf_simple_pull_le32(buf);
+        s8_t tmp = net_buf_simple_pull_u8(buf);
+        u16_t airp = net_buf_simple_pull_le16(buf);
+        u16_t humidity = net_buf_simple_pull_le16(buf);
+        u8_t uart_buf[10];
+        u8_t cnt = 0;
+	s32_t index;
+	s8_t ret;
+
+	ret = get_avail_ts_record(&index, node_ts_record, ctx);
+	if (ret == 1) {
+		timestamp = node_ts_record[index].timestamp + timestamp;
+	} else {
+			printk("%s: No timstamp record found\n", __func__);
+	}
+
+        uart_buf[cnt++] = ENVI_REPORT_TYPE;
+        uart_buf[cnt++] = timestamp >> 24 & 0xFF;
+        uart_buf[cnt++] = timestamp >> 16 & 0xFF;
+        uart_buf[cnt++] = timestamp >> 8 & 0xFF;
+        uart_buf[cnt++] = timestamp & 0xFF;
+        uart_buf[cnt++] = (ctx->addr >> 8) & 0xFF;
+        uart_buf[cnt++] = (ctx->addr) & 0xFF;
+        uart_buf[cnt++] = tmp;
+        uart_buf[cnt++] = airp;
+        uart_buf[cnt++] = humidity;
+
+        uart_send(uart_buf, cnt);
+
+        printk("------------------------\n");
+        printk("TimeStamp: %u\n", timestamp);
+        printk("-->[0x%04x] ", ctx->addr);
+        printk("tmp:%hhd airp:%hu humidity:%hu\n", tmp, airp, humidity);
+        printk("-------------------------\n");
+}
+
+static void envi_report_status(struct bt_mesh_model *model,
+		struct bt_mesh_msg_ctx *ctx,
+		struct net_buf_simple *buf)
+{
+	u8_t status = net_buf_simple_pull_u8(buf);
+	u8_t uart_buf[2];
+	u8_t cnt = 0;
+
+	uart_buf[cnt++] = ENVI_REPORT_STATUS_TYPE;
+	uart_buf[cnt++] = status;
+	if (status) {
+		printk("\n-->[0x%04x] ", ctx->addr);
+		printk("ENABLE_ENVI_REPORT_ACK\n");
+
+	}
+	else {
+		printk("\n-->[0x%04x] ", ctx->addr);
+		printk("DISABLE_ENVI_REPORT_ACK\n");
+	}
+
+	uart_send(uart_buf, cnt);
+}
+
+static void btscan_filter_status(struct bt_mesh_model *model,
+		struct bt_mesh_msg_ctx *ctx,
+		struct net_buf_simple *buf)
+{
+	u8_t status = net_buf_simple_pull_u8(buf);
+	u8_t uart_buf[2];
+	u8_t cnt = 0;
+
+	uart_buf[cnt++] = BTSCAN_FILTER_STATUS_TYPE;
+	uart_buf[cnt++] = status;
+	if (status) {
+		printk("\n-->[0x%04x] ", ctx->addr);
+		printk("ENABLE_FILTER_ACK\n");
+
+	}
+	else {
+		printk("\n-->[0x%04x] ", ctx->addr);
+		printk("DISABLE_FILTER_ACK\n");
+	}
+
+	uart_send(uart_buf, cnt);
+}
+
+static void btscan_interval_status(struct bt_mesh_model *model,
+		struct bt_mesh_msg_ctx *ctx,
+		struct net_buf_simple *buf)
+{
+	u8_t status = net_buf_simple_pull_u8(buf);
+	u8_t uart_buf[6];
+	u8_t cnt = 0;
+
+	uart_buf[cnt++] = BTSCAN_INTERVAL_STATUS_TYPE;
+	uart_buf[cnt++] = status;
+
+	if (status) {
+		printk("\n-->[0x%04x] ", ctx->addr);
+		printk("ENABLE_INTERVAL_ACK\n");
+
+	}
+	else {
+		printk("\n-->[0x%04x] ", ctx->addr);
+		printk("DISABLE_INTERVAL_ACK\n");
+	}
+
+	uart_send(uart_buf, cnt);
+}
+
+static void btscan_report_status(struct bt_mesh_model *model,
+		struct bt_mesh_msg_ctx *ctx,
+		struct net_buf_simple *buf)
+{
+	u8_t status = net_buf_simple_pull_u8(buf);
+	u8_t uart_buf[6];
+	u8_t cnt = 0;
+
+	uart_buf[cnt++] = BTSCAN_REPORT_STATUS_TYPE;
+	uart_buf[cnt++] = status;
+
+	if (status) {
+		printk("\n-->[0x%04x] ", ctx->addr);
+		printk("BTSCAN_REPORT STARTED\n");
+
+	}
+	else {
+		printk("\n-->[0x%04x] ", ctx->addr);
+		printk("BTSCAN_REPORT STOPPED\n");
+	}
+
+	uart_send(uart_buf, cnt);
+}
+
+static void btscan_report(struct bt_mesh_model *model,
+		struct bt_mesh_msg_ctx *ctx,
+		struct net_buf_simple *buf)
+{
+        u8_t mac_addr[BLE_MAC_ADDR_LEN];
+        s8_t rssi = 0;
+	u32_t gw_current_timestamp;
+	s8_t i, j;
+	u8_t txn_id = net_buf_simple_pull_u8(buf);
+	u16_t cnt = 0;	
+	u8_t uart_buf[16];
+	u32_t timestamp, index;
+	s8_t ret;
+
+	switch (txn_id) {
+	case 0:
+		timestamp = net_buf_simple_pull_le32(buf);
+
+		ret = get_avail_ts_record(&index, btscan_ts_record, ctx);
+		if (ret == 1) {
+			btscan_ts_record[index].timestamp = timestamp;
+		} else if (ret == 2) {
+			btscan_ts_record[index].timestamp = timestamp;
+			btscan_ts_record[index].addr = ctx->addr;
+		} else {
+			printk("ERROR: ts_record_slot not available\n");
+			return;
+		}
+
+		return;
+	default:
+		for (i = 0; i < BLE_MAC_ADDR_LEN; i++)
+			mac_addr[i] = net_buf_simple_pull_u8(buf);
+			
+		//printk("-->[0x%04x] ", ctx->addr);
+		//printk("[%02d] ", txn_id);
+		rssi = net_buf_simple_pull_u8(buf);
+		//for (i = BLE_MAC_ADDR_LEN - 1; i >= 0; i--)
+		//	printk("%02x ", mac_addr[i]);
+
+		//printk(" [%03d]\n", rssi);
+	}
+	//pre_txn_id = txn_id;
+	timestamp = 0;
+	for (i = 0; i < MAX_NODE_IN_MESH_NW; ++i) {
+		if ((ctx->addr == btscan_ts_record[i].addr)) {
+                        //printf("TimeStamp = %u\n", btscan_ts_record[i].timestamp);
+			uart_buf[cnt++] = BTSCAN_REPORT_TYPE;
+			for (j = 0; j < MAX_NODE_IN_MESH_NW; j++) {
+				if((ctx->addr == node_ts_record[j].addr)) {
+					timestamp =  btscan_ts_record[i].timestamp + node_ts_record[j].timestamp;
+			//		printk("TimeStamp: %u\n", timestamp);
+					break;
+				}
+			}
+
+                        uart_buf[cnt++]	= timestamp >> 24 & 0xFF;	
+			uart_buf[cnt++]	= timestamp >> 16 & 0xFF;	
+			uart_buf[cnt++]	= timestamp >> 8 & 0xFF;	
+			uart_buf[cnt++]	= timestamp & 0xFF;
+                        uart_buf[cnt++] = (ctx->addr >> 8) & 0xFF;
+                        uart_buf[cnt++] = (ctx->addr) & 0xFF;
+			for (j = BLE_MAC_ADDR_LEN - 1; j >= 0; j--)
+				uart_buf[cnt++] = mac_addr[j];
+
+			uart_buf[cnt++] = rssi;
+			//for (i = 0; i < cnt; ++i)
+                          //printk("%d ", uart_buf[i]);
+
+			//printk("\n");
+			uart_send(uart_buf, cnt);
+			
+			printk("TimeStamp: %u\n", timestamp);
+			printk("-->[0x%04x] ", ctx->addr);
+			printk("[%02d] ", txn_id);
+
+			for (i = BLE_MAC_ADDR_LEN - 1; i >= 0; i--)
+				printk("%02x ", mac_addr[i]);
+
+			printk(" [%03d]\n", rssi);
+	
+			if (txn_id == 0xFF) {	
+				gw_current_timestamp = rtc2_read_timestamp();
+				if (gw_current_timestamp > timestamp) {
+					printk("-->[0x%04x] ", ctx->addr);
+					printk("delivery time = %u msec\n", gw_current_timestamp - timestamp);
+				}
+				else {
+					//printk("%s: Please set the GW time\n", __func__);
+					printk("delivery time: undefined\n");
+				}
+			}
+
+			return;
+		}
+	}
+}
+
+
+static void rtc_report(struct bt_mesh_model *model,
+		struct bt_mesh_msg_ctx *ctx,
+		struct net_buf_simple *buf)
+{
+	s32_t index;
+	int err;
+
+	NET_BUF_SIMPLE_DEFINE(msg, 1/*report_type*/ + 1/*interval*/ + 6/* mfg_id * 2 */ + 2 + 4);
+	printk(APP_NAME"%s\n", __func__);
+
+	get_avail_ts_record(&index, node_ts_record, ctx);
+	if (index < 0) {
+		printk("ts_record_slot not available\n");
+		return;
+	}
+	node_ts_record[index].addr = ctx->addr;
+	node_ts_record[index].timestamp = rtc2_read_timestamp();
+#if 0	
+	for (i = 0; i < MAX_NODE_IN_MESH_NW; i++) {
+		if (node_ts_record[i].used && \
+				((node_ts_record[i].addr) == (ctx->addr))) {
+			node_ts_record[i].timestamp = rtc2_read_timestamp();
+			printk("-->[0x%04x] ", ctx->addr);
+			printk("Set base timestamp for node 0x%04x = %u\n", \
+						ctx->addr, node_ts_record[i].timestamp);
+			goto start_report;
+		}
+	}
+
+	for (i = 0; i < MAX_NODE_IN_MESH_NW; i++) {
+		if (!node_ts_record[i].used) {
+			node_ts_record[i].addr = ctx->addr;
+			node_ts_record[i].timestamp = rtc2_read_timestamp();
+			node_ts_record[i].used = 1;
+			
+			printk("-->[0x%04x] ", ctx->addr);
+			printk("Set base timestamp for node 0x%04x = %u\n", \
+						ctx->addr, node_ts_record[i].timestamp);
+			goto start_report;
+		}
+	}
+
+	u32_t earliest_timestamp = 0;	
+	for (i = 0; i < MAX_NODE_IN_MESH_NW; i++) {
+		if (earliest_timestamp > node_ts_record[i].timestamp)
+			earliest_timestamp = node_ts_record[i].timestamp;
+	}
+
+	if (i < MAX_NODE_IN_MESH_NW) {
+		node_ts_record[i].addr = ctx->addr;
+		node_ts_record[i].timestamp = rtc2_read_timestamp();
+		node_ts_record[i].used = 1;
+	} else {
+		printk("ERROR: No space for new nodes\n");
+		return;
+	}
+#endif
+
+//start_report:
+	bt_mesh_model_msg_init(&msg, OP_RTC_REPORT_TO_GW_STATUS);
+	err = snd_msg(mod_cli, ctx, &msg);
+	if (err)
+		printk("OP_RTC_REPORT_TO_GW_STATUS command failed, Plz restart the GW or SRV node\n");
+#if 0
+	bt_mesh_model_msg_init(&msg, OP_BTSCAN_FILTER_SET);
+	net_buf_simple_add_mem(&msg, mfg_id1, ARRAY_SIZE(mfg_id1));
+	net_buf_simple_add_mem(&msg, mfg_id2, ARRAY_SIZE(mfg_id2));
+	net_buf_simple_add_u8(&msg, 1 /*enable_bt_scan_filter*/);
+	err = snd_msg(mod_cli, ctx, &msg);
+	if (err)
+		printk("OP_BTSCAN_FILTER_SET command failed, Plz restart the GW or SRV node\n");
+	
+	k_sleep(K_MSEC(200));
+#endif
+#if 0	
+	bt_mesh_model_msg_init(&msg, OP_ENVI_INTERVAL_SET);
+	net_buf_simple_add_u8(&msg, 1); /*start envi report*/
+	err = snd_msg(mod_cli, ctx, &msg);
+	if (err)
+		printk("OP_BTSCAN_INTERVAL_SET command failed, Plz restart the GW or SRV node\n");
+	
+	bt_mesh_model_msg_init(&msg, OP_ENVI_REPORT_SET);
+	net_buf_simple_add_u8(&msg, 1); /*start envi report*/
+	err = snd_msg(mod_cli, ctx, &msg);
+	if (err)
+		printk("OP_BTSCAN_REPORT_SET command failed, Plz restart the GW or SRV node\n");
+#endif
+}
+
+static const struct bt_mesh_model_op gen_onoff_cli_op[] = {
+	{  OP_ENVI_REPORT, 0, envi_report},
+	{  OP_ENVI_REPORT_STATUS, 0, envi_report_status},
+	{  OP_BTSCAN_FILTER_STATUS, 0, btscan_filter_status},
+	{  OP_BTSCAN_INTERVAL_STATUS, 0, btscan_interval_status},
+	{  OP_BTSCAN_REPORT_STATUS, 0, btscan_report_status},
+	{  OP_BTSCAN_REPORT, 0, btscan_report},
+	{  OP_RTC_REPORT, 0, rtc_report},
+	{  OP_NODE_SYSTEM_RESET_STATUS, 0, node_system_reset_status},
+	{  OP_NODE_SYSTEM_SHUTDOWN_STATUS, 0, node_system_shutdown_status},
+	BT_MESH_MODEL_OP_END,
+};
+
+static struct bt_mesh_model root_models[] = {
+	BT_MESH_MODEL_CFG_SRV(&cfg_srv),
+	BT_MESH_MODEL_CFG_CLI(&cfg_cli),
+	BT_MESH_MODEL(BT_MESH_MODEL_ID_GEN_ONOFF_CLI, gen_onoff_cli_op, &gen_onoff_pub_cli, NULL),
+
+};
+
+static struct bt_mesh_elem elements[] = {
+	BT_MESH_ELEM(0, root_models, BT_MESH_MODEL_NONE),
+};
+
+static const struct bt_mesh_comp comp = {
+	.cid = BT_COMP_ID_LF,
+	.elem = elements,
+	.elem_count = ARRAY_SIZE(elements),
+};
+
+static void prov_complete(u16_t net_idx, u16_t addr)
+{
+	struct bt_mesh_elem *ele = &elements[0];
+
+	printk(APP_NAME"%s\n", __func__);
+	board_prov_complete();
+	addr = ele->addr;
+	printk("GW_ADDR = 0x%04x\n", addr);
+}
+
+
+static const u8_t dev_uuid[16] = { 0xda, 0xdd };
+
+static const struct bt_mesh_prov prov = {
+	.uuid = dev_uuid,
+	.complete = prov_complete,
+};
+
+static void bt_ready(int err)
+{
+	char adv_name_buf[24];
+	char addr_buf[8];
+	struct bt_mesh_elem *ele;;
+
+	if (err) {
+		printk(APP_NAME"%s: Bluetooth init failed (err %d)\n", __func__, err);
+		return;
+	}
+
+	printk(APP_NAME"%s:Bluetooth initialized\n", __func__);
+
+	board_init();
+
+	err = bt_mesh_init(&prov, &comp);
+	if (err) {
+		printk(APP_NAME"%s: Initializing mesh failed (err %d)\n", __func__, err);
+		return;
+	}
+
+	if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
+		settings_load();
+	}
+
+	/* This will be a no-op if settings_load() loaded provisioning info */
+        err = bt_mesh_prov_enable(BT_MESH_PROV_ADV | BT_MESH_PROV_GATT);
+	if (err == -EALREADY) {
+		printk("\nUsing stored settings\n");
+		ele = &elements[0];
+		addr = ele->addr;
+		printk("GW_ADDR = 0x%04x\n", addr);
+	} else {
+		printk("\n\nPlease provision the node\n\n");
+	}
+
+	printk(APP_NAME"%s: Mesh initialized\n", __func__);
+	mod_cli = &root_models[ARRAY_SIZE(root_models)-1];
+	mod_pub = mod_cli->pub;
+	printk("\n....I AM GW....\n");
+	printk("ADV NAME = %04x\n", node_id());
+	print_mac_addr();
+
+	strcpy(adv_name_buf, GW_ADV_NAME_PREFIX);
+	strcat(adv_name_buf, get_addr_in_string(addr_buf, sizeof(addr_buf), node_id()));
+	err = bt_set_name(adv_name_buf);
+	if(err)
+		printk("bt_set_name failed, err=%d\n", err);
+
+	counter_init();
+}
+
+#define MESH_FIFO_SIZE 256
+#define UART_FIFO_SIZE 256
+uint8_t mesh_ring_buffer[MESH_FIFO_SIZE];
+uint8_t uart_ring_buffer[UART_FIFO_SIZE];
+static void gsm_uart_init(void);
+cbuf_handle_t g_cbuf_mesh;
+cbuf_handle_t g_cbuf_uart;
+void main(void)
+{
+	int err;
+
+	k_thread_suspend(snd_cmd_tid);
+	k_thread_suspend(uart_out_tid);
+	k_thread_suspend(nw_range_led_tid);
+	static struct circular_buf_t g_cbuf_mesh_buf;
+	static struct circular_buf_t g_cbuf_uart_buf;
+	g_cbuf_mesh = circular_buf_init(&g_cbuf_mesh_buf, mesh_ring_buffer, MESH_FIFO_SIZE);
+	g_cbuf_uart = circular_buf_init(&g_cbuf_uart_buf, uart_ring_buffer, UART_FIFO_SIZE);
+	k_thread_resume(uart_out_tid);
+
+	err = bt_enable(bt_ready);
+	if (err) {
+		printk("Bluetooth init failed (err %d)\n", err);
+	}
+
+	sw_device = device_get_binding(DT_GPIO_KEYS_SW0_GPIOS_CONTROLLER);
+	gpio_pin_configure(sw_device, DT_GPIO_KEYS_SW0_GPIOS_PIN,
+			(GPIO_DIR_IN | GPIO_INT | GPIO_INT_EDGE |
+			 GPIO_INT_ACTIVE_LOW | GPIO_PUD_PULL_UP));
+#if !CONFIG_BOARD_NRF52840_PCA10059
+	gpio_pin_configure(sw_device, DT_GPIO_KEYS_SW1_GPIOS_PIN,
+			(GPIO_DIR_IN | GPIO_INT | GPIO_INT_EDGE |
+			 GPIO_INT_ACTIVE_LOW | GPIO_PUD_PULL_UP));
+	gpio_pin_configure(sw_device, DT_GPIO_KEYS_SW2_GPIOS_PIN,
+			(GPIO_DIR_IN | GPIO_INT | GPIO_INT_EDGE |
+			 GPIO_INT_ACTIVE_LOW | GPIO_PUD_PULL_UP));
+	gpio_pin_configure(sw_device, DT_GPIO_KEYS_SW3_GPIOS_PIN,
+			(GPIO_DIR_IN | GPIO_INT | GPIO_INT_EDGE |
+			 GPIO_INT_ACTIVE_LOW | GPIO_PUD_PULL_UP));
+#endif
+	gpio_init_callback(&button_cb, button_pressed,
+			BIT(DT_GPIO_KEYS_SW0_GPIOS_PIN)
+#if !CONFIG_BOARD_NRF52840_PCA10059
+			| BIT(DT_GPIO_KEYS_SW1_GPIOS_PIN)
+			| BIT(DT_GPIO_KEYS_SW2_GPIOS_PIN)
+			| BIT(DT_GPIO_KEYS_SW3_GPIOS_PIN)
+#endif
+		);
+
+	gpio_add_callback(sw_device, &button_cb);
+	gpio_pin_enable_callback(sw_device, DT_GPIO_KEYS_SW0_GPIOS_PIN);
+#if !CONFIG_BOARD_NRF52840_PCA10059 
+	gpio_pin_enable_callback(sw_device, DT_GPIO_KEYS_SW1_GPIOS_PIN);
+	gpio_pin_enable_callback(sw_device, DT_GPIO_KEYS_SW2_GPIOS_PIN);
+	gpio_pin_enable_callback(sw_device, DT_GPIO_KEYS_SW3_GPIOS_PIN);
+#endif
+
+#if CONFIG_BOARD_NRF52840_PCA10059
+	init_led(DT_ALIAS_LED2_GPIOS_CONTROLLER, DT_ALIAS_LED2_GPIOS_PIN);
+#else
+	init_led(DT_ALIAS_LED1_GPIOS_CONTROLLER, DT_ALIAS_LED1_GPIOS_PIN);
+#endif
+
+	gsm_uart_init();
+}
+
+#if 0
+static uint8_t pin_to_sw(uint32_t pin_pos)
+{
+	switch (pin_pos) {
+	case BIT(DT_GPIO_KEYS_SW0_GPIOS_PIN): return 0;
+#if !CONFIG_BOARD_NRF52840_PCA10059 
+	case BIT(DT_GPIO_KEYS_SW1_GPIOS_PIN): return 1;
+	case BIT(DT_GPIO_KEYS_SW2_GPIOS_PIN): return 2;
+	case BIT(DT_GPIO_KEYS_SW3_GPIOS_PIN): return 3;
+#endif
+
+	default:
+		printk("Invalid pin_pos\n");
+	}
+
+	printk("No match for GPIO pin 0x%08x\n", pin_pos);
+
+	return 0;
+}
+#endif
+static volatile u8_t button;
+static void button_pressed(struct device *dev, struct gpio_callback *cb,
+		u32_t pin_pos)
+{
+#if 0
+	time = k_uptime_get_32();
+
+	/* debounce the switch */
+	if (time < last_time + BUTTON_DEBOUNCE_DELAY_MS) {
+		last_time = time;
+		return;
+	}
+
+	last_time = time;
+
+	button = pin_to_sw(pin_pos);
+
+	printk(APP_NAME"%s\n", __func__);
+
+	if (button_busy[button]) {
+		printk(APP_NAME"button-%d is busy\n", button);
+		return;
+	}
+
+	button_busy[button] = 1;
+
+	k_thread_resume(snd_cmd_tid);
+#endif
+}
+
+void nw_range_led_thread(void)
+{
+	int err;
+
+	while (1) {
+		bt_mesh_model_msg_init(mod_pub->msg, OP_NW_RANGE_LED_SET);
+		err = publish_msg(mod_cli);
+		if (err)
+			printk("%s: publish message failed\n", __func__);
+
+		k_sleep(K_MSEC(1000));
+
+		if (!nw_range_led_enable)
+			k_thread_suspend(nw_range_led_tid);
+	}
+}
+
+#define BTSCAN_REPORT_SET       0x0
+#define BTSCAN_INTERVAL_SET     0x1
+#define BTSCAN_FILTER_SET       0x2
+#define ENVI_REPORT_SET         0x3
+#define ENVI_INTERVAL_SET       0x4
+#define NODE_SYSTEM_RESET       0x5
+#define NODE_SYSTEM_SHUTDOWN    0x6
+#define NW_RANGE_LED_SET        0x7
+
+static void snd_cmd_thread(void)
+{
+	int err;
+	u8_t data;
+	u8_t mfg_id_count;
+	u16_t mfg_id;
+	static bool cmd_flg = false;
+
+	while (1) {
+			
+		while (!circular_buf_get(g_cbuf_mesh, &data)) {
+			if (data == '<') {
+				cmd_flg = true;
+				continue;
+			}
+			if (cmd_flg == true && data != '>') {
+				button = data;
+				cmd_flg = false;
+				break;
+			} else {
+				continue;
+			}
+		}
+
+		switch (button) {
+			case BTSCAN_REPORT_SET:
+				bt_mesh_model_msg_init(mod_pub->msg, OP_BTSCAN_REPORT_SET);
+				printk("BTSCAN_REPORT_SET\n");
+
+				circular_buf_get(g_cbuf_mesh, &data);
+				if (data == 1) {
+					printk("Start BTSCAN REPORT\n");
+				} else if (data == 0) {
+					printk("Stop BTSCAN REPORT\n");
+				} else {
+					printk("Invalid BTSCAN setting field\n");
+					goto release_button;
+				}
+
+				net_buf_simple_add_u8(mod_pub->msg, data);
+						
+				err = publish_msg(mod_cli);
+				if (err)
+					goto release_button;
+
+				break;
+			case BTSCAN_FILTER_SET:
+				bt_mesh_model_msg_init(mod_pub->msg, OP_BTSCAN_FILTER_SET);
+				printk("BTSCAN_FILTER_SET\n");
+				
+				circular_buf_get(g_cbuf_mesh, &data);
+				if (data == 1) {
+					printk("Enable BTSCAN FILTER\n");
+				} else if (data == 0) {
+					printk("Disable BTSCAN FILTER\n");
+				} else {
+					printk("Invalid BTSCAN filter field\n");
+					goto release_button;
+				}
+
+				net_buf_simple_add_u8(mod_pub->msg, data); //Command
+				
+				circular_buf_get(g_cbuf_mesh, &data);
+				mfg_id_count = data;
+				net_buf_simple_add_u8(mod_pub->msg, mfg_id_count); //MFG ID count
+				u8_t i;	
+				for (i = 0; i < mfg_id_count; ++i) {
+						circular_buf_get(g_cbuf_mesh, &data);
+						mfg_id = data;
+						mfg_id <<= 8;
+						circular_buf_get(g_cbuf_mesh, &data);
+						mfg_id |= data;
+						net_buf_simple_add_le16(mod_pub->msg, mfg_id);
+				}
+
+				err = publish_msg(mod_cli);
+				if (err)
+					goto release_button;
+
+				break;
+			case BTSCAN_INTERVAL_SET:
+				bt_mesh_model_msg_init(mod_pub->msg, OP_BTSCAN_INTERVAL_SET);
+				printk("BTSCAN_INTERVAL_SET\n");
+				circular_buf_get(g_cbuf_mesh, &data);
+				printk("btscan interval = %d\n", data);
+				net_buf_simple_add_u8(mod_pub->msg, data);
+
+				err = publish_msg(mod_cli);
+				if (err)
+					goto release_button;
+
+				break;
+			case ENVI_REPORT_SET:
+				bt_mesh_model_msg_init(mod_pub->msg, OP_ENVI_REPORT_SET);
+				printk("ENVI_REPORT_SET\n");
+
+				circular_buf_get(g_cbuf_mesh, &data);
+				if (data == 1) {
+					printk("Start ENVI REPORT\n");
+				} else if (data == 0) {
+					printk("Stop ENVI REPORT\n");
+				} else {
+					printk("Invalid ENVI setting field\n");
+					goto release_button;
+				}
+
+				net_buf_simple_add_u8(mod_pub->msg, data);
+						
+				err = publish_msg(mod_cli);
+				if (err)
+					goto release_button;
+				break;
+			case ENVI_INTERVAL_SET:
+				bt_mesh_model_msg_init(mod_pub->msg, OP_ENVI_INTERVAL_SET);
+				printk("ENVI_INTERVAL_SET\n");
+				circular_buf_get(g_cbuf_mesh, &data);
+				printk("envi interval = %d\n", data);
+				net_buf_simple_add_u8(mod_pub->msg, data);
+
+				err = publish_msg(mod_cli);
+				if (err)
+					goto release_button;
+				break;
+			
+			case NODE_SYSTEM_RESET:
+				bt_mesh_model_msg_init(mod_pub->msg, OP_NODE_SYSTEM_RESET);
+				printk("NODE_SYSTEM_RESET\n");
+				err = publish_msg(mod_cli);
+				if (err)
+					goto release_button;
+				break;
+
+			case NODE_SYSTEM_SHUTDOWN:
+				bt_mesh_model_msg_init(mod_pub->msg, OP_NODE_SYSTEM_SHUTDOWN);
+				printk("NODE_SYSTEM_SHUTDOWN\n");
+				err = publish_msg(mod_cli);
+				if (err)
+					goto release_button;
+				break;
+
+			case NW_RANGE_LED_SET:
+				bt_mesh_model_msg_init(mod_pub->msg, OP_NW_RANGE_LED_SET);
+				printk("NW_RANGE_LED_SET\n");
+
+				circular_buf_get(g_cbuf_mesh, &data);
+				if (data == 1) {
+					nw_range_led_enable = 1;
+					k_thread_resume(nw_range_led_tid);
+					printk("Start NW RANGE LED\n");
+				} else if (data == 0) {
+					nw_range_led_enable = 0;
+					//k_thread_suspend(nw_range_led_tid);
+					printk("Stop NW RANGE LED\n");
+				} else {
+					printk("Invalid NW RANGE LED setting field\n");
+					goto release_button;
+				}
+
+				net_buf_simple_add_u8(mod_pub->msg, data);
+						
+				err = publish_msg(mod_cli);
+				if (err)
+					goto release_button;
+				break;
+
+			default:
+				printk(APP_NAME"Invalid button\n");
+		}
+
+release_button:
+		button_busy[button] = 0;
+		k_thread_suspend(snd_cmd_tid);
+	}
+}
+
+unsigned char cmd[2];
+char rx_buf[2][32];
+u8_t *read_ptr;
+u8_t *next_buf = rx_buf[1];
+static volatile bool avail = 1;
+struct device *uart_dev;
+static u8_t tmp_buf[255];
+static u8_t buf[255];
+static volatile bool tx_sent;
+
+void mesh_send(u8_t *data, u8_t data_len)
+{
+	char buf[128], cmd_buf[32];
+	u8_t buf_len, i, cmd_len;
+	u8_t chksum;
+	buf_len = format_uart_in_string(buf, data, data_len);
+
+	for (i = 0; i < buf_len; ++i)
+		printk("%d ", buf[i]);
+	printk("\n");
+
+	chksum = 0;
+	cmd_len = 0;
+	cmd_buf[cmd_len++] = '<';
+	for (i = 2; i < buf[1] + 2; ++i) {
+		chksum += buf[i];
+		cmd_buf[cmd_len++] = buf[i];
+	}
+	cmd_buf[cmd_len++] = '>';
+	
+	if (chksum != buf[buf_len - 2]) {
+		printk("%s:chksum not matched\n", __func__);
+		return;
+	}
+
+	circular_buf_put(g_cbuf_mesh, cmd_buf, cmd_len);
+	k_thread_resume(snd_cmd_tid);
+}
+
+void uart_out_thread(void)
+{
+	u8_t data;
+
+	while (1) {
+
+		while (!circular_buf_get(g_cbuf_uart, &data)) {
+			tx_sent = 0;	
+			uart_tx(uart_dev, &data, 1, 100);
+			while (!tx_sent);
+		}
+			
+		k_thread_suspend(uart_out_tid);
+	}
+}
+
+u8_t format_uart_out_string(char *buf, u8_t *data, u8_t data_len)
+{
+	char temp[6] = {0};
+	u8_t chksum = 0;
+	u16_t cnt = 0;
+	int i, j;
+		buf[cnt++] = '<';
+	//	printk("buf[%d] = %c\n", cnt-1, buf[cnt-1]);
+	//	printk("data_len = %d\n", data_len);
+		memset(temp, 0, sizeof(temp));
+		snprintf(temp, sizeof(temp), "%d", data_len);
+		for (i = 0; i < sizeof(temp) && temp[i] != '\0'; ++i) {
+			buf[cnt++] = temp[i];
+	//		printk("buf[%d] = %c\n", cnt-1, buf[cnt-1]);
+		}
+		buf[cnt++] = ',';
+		for (i = 0; i < data_len; ++i) {
+			memset(temp, 0, sizeof(temp));
+			snprintf(temp, sizeof(temp), "%d", data[i]);
+
+			for (j = 0; j < sizeof(temp) && temp[j] != '\0'; ++j) {
+				buf[cnt] = temp[j];
+	//			printk("buf[%d] = %c\n", cnt, buf[cnt]);
+				++cnt;
+			}
+			chksum += data[i];
+
+			buf[cnt++] = ',';
+	//		printk("buf[%d] = %c\n", cnt-1, buf[cnt-1]);
+		}
+
+		//printk("chksum = %d\n", chksum);
+		memset(temp, 0, sizeof(temp));
+		snprintf(temp, sizeof(temp), "%d", chksum);
+		for (j = 0; j < sizeof(temp) && temp[j] != '\0'; ++j) {
+			buf[cnt++] = temp[j];
+	//		printk("buf[%d] = %c\n", cnt-1, buf[cnt-1]);
+		}
+
+
+		buf[cnt++] = '>';
+	//	printk("buf[%d] = %c\n", cnt-1, buf[cnt-1]);
+
+	//	for (i = 0; i < cnt; ++i)
+		//	printk("%c", buf[i]);
+
+//		printk("\n");
+		return cnt;
+}
+
+u8_t format_uart_in_string(char *buf, u8_t *data, u8_t data_len)
+{
+	char tmp_buf[32];
+	u8_t cnt = 0,i, j = 0;
+
+	//printk("%s\n", __func__);
+
+	if (data[0] != '<' || (data[data_len - 1] != '>')) {
+		printk("%s: Invalid uart input string\n", __func__);
+		return -1;
+	}
+
+	buf[cnt++] = '<';
+	for (i = cnt; i < data_len; ++i) {
+		if (data[i] == ',' || data[i] == '>') {
+			tmp_buf[j] = '\0';
+			buf[cnt++] = atoi(tmp_buf);	
+			j = 0;	
+			continue;
+		}
+
+		if (data[i] >= '0' && data[i] <= '9')
+			tmp_buf[j++] = data[i];
+	}
+
+	buf[cnt++] = '>';
+	
+	//for (i = 0; i < cnt; ++i)
+	//	printk("%d ", buf[i]);
+	
+	//printk("\n");
+
+	return cnt;
+}
+void uart_send(u8_t *data, u8_t data_len)
+{
+	u8_t buf_len;
+	char buf[128];
+
+	if (!data_len)
+		return;
+
+//	printk("sizeofbuf = %d\n", sizeof(buf));
+	buf_len = format_uart_out_string(buf, data, data_len);
+	circular_buf_put(g_cbuf_uart, buf, buf_len);
+	k_thread_resume(uart_out_tid);
+}
+
+void echo_uart(u8_t *data, u8_t data_len)
+{
+//	circular_buf_put(g_cbuf_uart, data, data_len);
+
+}
+void read_callback(struct uart_event *evt, void *user_data)
+{
+	int i;
+	static u16_t tmp_buf_cnt, start_flag, cmd_len;
+	const u16_t tmp_buf_size = sizeof(tmp_buf);
+
+	switch (evt->type) {
+	case UART_TX_DONE:
+		tx_sent = 1;
+		break;
+	case UART_RX_RDY:
+		read_ptr = evt->data.rx.buf + evt->data.rx.offset;
+		memset(buf, 0, sizeof(buf));
+		for (i = 0; i < evt->data.rx.len; ++i) {
+			buf[i] = read_ptr[i];
+		}
+
+		if (buf[0] == '<') {
+			echo_uart("\n\r", sizeof("\n\r"));
+			tmp_buf_cnt = 0;
+			start_flag = 1;
+			memset(tmp_buf, 0, sizeof(tmp_buf));
+			for (i = 0; (i < evt->data.rx.len) && (tmp_buf_cnt < tmp_buf_size) && (buf[i] != '>'); ++i) {
+				tmp_buf[tmp_buf_cnt++] = buf[i];
+				echo_uart(&buf[i], 1);
+			}
+
+			cmd_len = tmp_buf_cnt;
+			if (buf[i] == '>') {
+				echo_uart(&buf[i], 1);
+				tmp_buf[tmp_buf_cnt] = buf[i];
+				tmp_buf_cnt = 0;
+				start_flag = 0;
+				++cmd_len;
+				mesh_send(tmp_buf, cmd_len);
+				echo_uart("\n\r", sizeof("\n\r"));
+			}
+				
+		} else if (start_flag == 1) {
+			for (i = 0; (i < evt->data.rx.len) && (tmp_buf_cnt < tmp_buf_size) && (buf[i] != '>'); ++i) {
+				tmp_buf[tmp_buf_cnt++] = buf[i];
+				echo_uart(&buf[i], 1);
+			}
+
+			cmd_len = tmp_buf_cnt;
+			if(buf[i] == '>') {
+				echo_uart(&buf[i], 1);
+				tmp_buf[tmp_buf_cnt] = buf[i];
+				tmp_buf_cnt = 0;
+				start_flag = 0;
+				++cmd_len;
+				mesh_send(tmp_buf, cmd_len);
+				echo_uart("\n\r", sizeof("\n\r"));
+			}
+		}
+
+		cmd_len = 0;
+		break;
+	case UART_RX_BUF_REQUEST:
+		if (avail == 1) {
+		uart_rx_buf_rsp(uart_dev, rx_buf[avail], sizeof(rx_buf[0]));
+			avail = 0;
+		}
+		else {
+		uart_rx_buf_rsp(uart_dev, rx_buf[avail], sizeof(rx_buf[0]));
+			avail = 1;
+		}
+		break;
+	case UART_RX_BUF_RELEASED:
+		break;
+	case UART_RX_DISABLED:
+		break;
+	case UART_TX_ABORTED:
+		break;
+	case UART_RX_STOPPED:
+		break;
+	default:
+		break;
+	}
+
+}
+
+static void gsm_uart_init(void)
+{
+	uart_dev = device_get_binding("UART_1");
+	uart_callback_set(uart_dev, read_callback, NULL);
+	uart_rx_enable(uart_dev, rx_buf[0], 10, 50);
+}
+
+s32_t get_avail_ts_record(s32_t *index, struct timestamp_record *ts_record, struct bt_mesh_msg_ctx *ctx)
+{
+	s32_t i;
+
+	for (i = 0; i < MAX_NODE_IN_MESH_NW; ++i) {
+		if (((ts_record[i].addr) == (ctx->addr))) {
+                //printk("[0x%04x] ts_record[%d].addr = 0x%04x, \n", ctx->addr, i, ts_record[i].addr);
+			(*index) = i;
+			return 1; /*already available*/
+		}
+	}
+        //printk("%s: addr not found\n", __func__);
+	u32_t oldest_timestamp = ts_record[0].timestamp ;	
+	s32_t oldest_timestamp_index = 0;
+	for (i = 0; i < MAX_NODE_IN_MESH_NW; ++i) {
+           //printk("[0x%04x] ts_recorrd[%d].timstamp = %u\n", ctx->addr, i, ts_record[i].timestamp);
+		if (!ts_record[i].timestamp) {
+                 //printk("[0x%04x] Oldest-A ts_record[%d].timstamp = %u\n", ctx->addr, i, ts_record[i].timestamp);
+                 (*index) = i;
+                 return 2;
+		}
+		if (oldest_timestamp > ts_record[i].timestamp) {
+			oldest_timestamp_index = i;
+                        oldest_timestamp = ts_record[i].timestamp;
+                     }
+	}
+
+	if (i < MAX_NODE_IN_MESH_NW) {
+//                printk("[0x%04x] Oldest-B ts_record[%d].timstamp = %u\n", ctx->addr, (*index), ts_record[*index].timestamp);
+		(*index) = oldest_timestamp_index;
+		return 2; /*overwritten on oldest*/
+	} else {
+		printk("ERROR: No space for new nodes\n");
+		return -1; /*Not available*/
+	}
+}

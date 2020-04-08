@@ -1,0 +1,211 @@
+#ifndef MISC_H
+#define MISC_H
+
+#include <fieldsightlib.h>
+#include <bluetooth/fieldsight_node_global.h>
+//#include "op_code.h"
+
+static void btscan_thread(void);
+static void envi_thread(void);
+K_THREAD_DEFINE(btscan_tid,2048, btscan_thread, NULL, NULL, NULL, 7, 0, K_NO_WAIT); // old 1536
+K_THREAD_DEFINE(envi_tid, 2048, envi_thread, NULL, NULL, NULL, 7, 0, K_NO_WAIT); // old 1024
+
+s8_t die_temperature(void);
+static inline void snd_btscan_report(void)
+{
+	unsigned char temp;
+	int ret;
+	s8_t i, j;
+	u8_t count = 0;
+	u32_t timestamp = rtc2_read_timestamp();
+	//s16_t temperature = die_temperature();
+	u8_t alert = 1;
+	u16_t steps = 40000;
+
+	if (!btscan_cnt) {
+		printk("No BLE devices in range\n");
+		return;
+	}
+
+#if 0
+	printk("[<--0x%04x]:timestamp = %u\n", cfg->node_addr, timestamp);
+#endif
+//	NET_BUF_SIMPLE_DEFINE(msg, 9/*msg size*/ + 2/*OPCODE SIZE*/ + 4/*MIC SIZE*/);
+
+		bt_mesh_model_msg_init(cfg->mod_pub->msg, OP_BTSCAN_TIMESTAMP_REPORT);
+		net_buf_simple_add_le32(cfg->mod_pub->msg, timestamp);
+		ret = bt_mesh_model_publish(cfg->mod_cli);
+		if (ret) { 
+			printk("\n%s:bt_mesh_model_publish failed, ERR = %d\n", __func__, ret);
+			return;
+		}
+
+		k_sleep(K_MSEC(125));
+
+
+	
+	for (i = 0; i < btscan_cnt; ++i, ++count) {
+
+		bt_mesh_model_msg_init(cfg->mod_pub->msg, OP_BTSCAN_MAC_RSSI_REPORT);
+			
+		net_buf_simple_add_u8(cfg->mod_pub->msg, MAC_RSSI_TYPE);
+		
+		if ((i + 1) != btscan_cnt)
+			net_buf_simple_add_u8(cfg->mod_pub->msg, i);
+		else
+			net_buf_simple_add_u8(cfg->mod_pub->msg, 0xFF);
+
+		for (j = 0; j < BLE_MAC_ADDR_LEN; j++)
+			net_buf_simple_add_u8(cfg->mod_pub->msg, (btscan_mac_addr[i] >> (j * 8)) & 0xFF);
+
+		net_buf_simple_add_u8(cfg->mod_pub->msg, btscan_rssi[i]);
+#if 0
+		printk("[<--0x%04x] ", cfg->node_addr);
+		printk("[%02d] ", i+1);
+
+		printk("[");
+#endif
+		for (j = BLE_MAC_ADDR_LEN - 1; j >= 0; j--) {
+			temp = (btscan_mac_addr[i] >> (j * 8)) & 0xFF;
+#if 0
+			printk("%02x ", temp);
+#endif
+		}
+#if 0
+		printk("\b] ");
+
+		printk(" [%d]", btscan_rssi[i]);
+		printk(" [%04x]\n", mfg_filter_id[i]);
+		
+#endif		ret = bt_mesh_model_publish(cfg->mod_cli);
+		if (ret) { 
+			printk("\n%s:bt_mesh_model_publish failed, ERR = %d\n", __func__, ret);
+			return;
+		}
+		
+		k_sleep(K_MSEC(122));
+
+		bt_mesh_model_msg_init(cfg->mod_pub->msg, OP_BTSCAN_MAC_RSSI_REPORT);
+		net_buf_simple_add_u8(cfg->mod_pub->msg, SENSOR_DATA_TYPE1);
+		if ((i + 1) != btscan_cnt)
+			net_buf_simple_add_u8(cfg->mod_pub->msg, i);
+		else
+			net_buf_simple_add_u8(cfg->mod_pub->msg, 0xFF);
+		
+		net_buf_simple_add_le16(cfg->mod_pub->msg, beacon_sensor_data[i].beacon_temperature);
+		net_buf_simple_add_le16(cfg->mod_pub->msg, beacon_sensor_data[i].beacon_humidity);
+		net_buf_simple_add_le16(cfg->mod_pub->msg, beacon_sensor_data[i].beacon_airp);
+		
+		ret = bt_mesh_model_publish(cfg->mod_cli);
+		if (ret) { 
+			printk("\n%s:bt_mesh_model_publish failed, ERR = %d\n", __func__, ret);
+			return;
+		}
+		
+		k_sleep(K_MSEC(122));
+		
+		bt_mesh_model_msg_init(cfg->mod_pub->msg, OP_BTSCAN_MAC_RSSI_REPORT);
+		net_buf_simple_add_u8(cfg->mod_pub->msg, SENSOR_DATA_TYPE2);
+		if ((i + 1) != btscan_cnt)
+			net_buf_simple_add_u8(cfg->mod_pub->msg, i);
+		else
+			net_buf_simple_add_u8(cfg->mod_pub->msg, 0xFF);
+	
+		net_buf_simple_add_le16(cfg->mod_pub->msg, steps);
+		net_buf_simple_add_u8(cfg->mod_pub->msg, alert);
+#if 0		
+		printk("temperature[%d]         = 0x%04x\n", i, beacon_sensor_data[i].beacon_temperature);
+		printk("humidity[%d]            = 0x%04x\n", i, beacon_sensor_data[i].beacon_humidity);
+		printk("airp[%d]                = 0x%04x\n", i, beacon_sensor_data[i].beacon_airp);
+		printk("steps[%d]               = 0x%04x\n", i, steps);
+		printk("alert[%d]               = 0x%02x\n", i, alert);
+#endif
+		ret = bt_mesh_model_publish(cfg->mod_cli);
+		if (ret) { 
+			printk("\n%s:bt_mesh_model_publish failed, ERR = %d\n", __func__, ret);
+			return;
+		}
+
+		k_sleep(K_MSEC(125));
+	}
+
+#if 0
+		printk("\n-----------------------------------------\n\n");
+#endif
+}
+
+static void btscan_thread(void)
+{
+
+	memset(btscan_mac_addr, 0, sizeof(btscan_mac_addr));
+	memset(btscan_rssi, 0, sizeof(btscan_rssi));
+
+	while (1) {
+
+		if (cfg->btscan_report_flg) {
+			cfg->btscan_read_enable = 0;
+			btscan_cnt = 0;
+
+			cfg->btscan_read_enable = 1;
+			k_sleep(K_MSEC(cfg->btscan_scan_window));
+			cfg->btscan_read_enable = 0;
+
+			snd_btscan_report();
+			btscan_cnt = 0;
+		} else {
+			k_thread_suspend(btscan_tid);
+		}
+
+
+		if (cfg->btscan_report_interval)
+			k_sleep(K_MSEC(cfg->btscan_report_interval));
+		else
+			k_thread_suspend(btscan_tid);
+
+	}
+}
+
+static inline void snd_envi_report(void)
+{
+        int ret;
+        u16_t airp = 18, humidity = 84;
+        s8_t temperature = die_temperature();
+        u32_t timestamp = rtc2_read_timestamp();
+	#if 0
+	printk("[<--0x%04x]:timestamp = %u\n", cfg->node_addr, timestamp);
+	#endif
+        bt_mesh_model_msg_init(cfg->mod_pub->msg, OP_ENVI_REPORT);
+        net_buf_simple_add_le32(cfg->mod_pub->msg, timestamp);
+        net_buf_simple_add_u8(cfg->mod_pub->msg, temperature);
+        net_buf_simple_add_le16(cfg->mod_pub->msg, airp);
+        net_buf_simple_add_le16(cfg->mod_pub->msg, humidity);
+        ret = bt_mesh_model_publish(cfg->mod_cli);
+        if (ret) {
+                printk("\n%s:bt_mesh_model_publish failed, ERR = %d\n", __func__, ret);
+                return;
+        }
+#if 0
+        printk("------------------------\n");
+        printk("TimeStamp: %u\n", timestamp);
+        printk("tmp:%hhd airp:%hu humidity:%hu\n", temperature, airp, humidity);
+        printk("-------------------------\n");
+#endif
+}
+
+void envi_thread(void)
+{
+	while (1) {
+
+		snd_envi_report();
+
+		if (cfg->envi_report_flg) {
+			if (cfg->envi_report_interval)
+				k_sleep(K_MSEC(cfg->envi_report_interval));
+			else
+				k_thread_suspend(envi_tid);
+		} else {
+			k_thread_suspend(envi_tid);
+		}
+	}
+}
+#endif /*MISC_H*/
