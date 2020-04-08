@@ -14,7 +14,6 @@
 #include <bluetooth/l2cap.h>
 #include <bluetooth/hci.h>
 #include <bluetooth/mesh.h>
-#include "board.h"
 
 #define APP_NAME "NODE-A"
 
@@ -118,7 +117,6 @@ static void prov_complete(u16_t net_idx, u16_t addr)
         net.net_idx = net_idx,
         net.dst = addr;
 	
-	board_prov_complete();
 	addr = ele->addr;
 	printk("GW_ADDR = 0x%04x\n", addr);
 }
@@ -147,7 +145,6 @@ static void bt_ready(int err)
 
 	printk(APP_NAME"%s:Bluetooth initialized\n", __func__);
 
-	board_init();
 
 	err = bt_mesh_init(&prov, &comp);
 	if (err) {
