@@ -2,6 +2,8 @@
 #include <device.h>
 #include <drivers/gpio.h>
 
+#define SELF_SUSPEND 0
+
 #define BUTTON_DEBOUNCE_DELAY_MS 250
 
 static uint8_t dummy_flg;
@@ -16,11 +18,17 @@ K_THREAD_DEFINE(dummy_tid, 2048, dummy_thread, NULL, NULL, NULL, 7, 0, 0);
 
 void dummy_thread(void)
 {
+	bool self_suspend = IS_ENABLED(SELF_SUSPEND);
 	while (1) {
-			k_sleep(K_MSEC(8000));
-			printk("flag = %d\n",dummy_flg);
-			printk("%s\n", __func__);
-			//k_thread_suspend(dummy_tid);
+
+		uint32_t now_ms = k_uptime_get_32();
+		k_sleep(K_MSEC(500));
+		printk("%u.%03u : %s flag = %d\n", now_ms / 1000U, now_ms % 1000,
+		       self_suspend ? "SUSPENDING" : "",
+		       dummy_flg);
+		if (self_suspend) {
+			k_thread_suspend(dummy_tid);
+		}
 	}
 }
 
@@ -76,8 +84,6 @@ void gpio_button_init(void)
 	gpio_init_callback(&button_cb_data, button_pressed,
 			   BIT(DT_GPIO_PIN(SW0_NODE, gpios)) | BIT(DT_GPIO_PIN(SW1_NODE, gpios)));
 	gpio_add_callback(dev_button, &button_cb_data);
-
-
 }
 
 static uint8_t pin_to_sw(uint32_t pin_pos)
@@ -118,13 +124,18 @@ static void button_pressed(const struct device *dev, struct gpio_callback *cb,
 
 static void dummy_thread_set(uint8_t button)
 {
+	static uint8_t rule = 0;
 	if (button) {
+		++rule;
+		if (rule & 0x01) {
+			printk("R%u Wakeup dummy thread\n", rule & 0x03);
+			k_wakeup(dummy_tid);
+		}
+		if (rule & 0x02) {
+			printk("R%u Resume dummy thread\n", rule & 0x03);
+			k_thread_resume(dummy_tid);
+		}
 
-		printk("Wakeup dummy thread\n");
-		k_wakeup(dummy_tid);
-
-		printk("Resume dummy thread\n");
-		k_thread_resume(dummy_tid);
 	} else {
 		printk("Suspend dummy thread\n");
 		k_thread_suspend(dummy_tid);
