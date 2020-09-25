@@ -2,7 +2,8 @@
 #include <device.h>
 #include <drivers/gpio.h>
 
-#define SELF_SUSPEND 0
+#define SELF_SUSPEND 1
+#define SLEEP_S 10
 
 #define BUTTON_DEBOUNCE_DELAY_MS 250
 
@@ -20,10 +21,10 @@ void dummy_thread(void)
 {
 	bool self_suspend = IS_ENABLED(SELF_SUSPEND);
 	while (1) {
-
+		printk("pre-sleep\n");
+		k_sleep(K_SECONDS(SLEEP_S));
 		uint32_t now_ms = k_uptime_get_32();
-		k_sleep(K_MSEC(500));
-		printk("%u.%03u : %s flag = %d\n", now_ms / 1000U, now_ms % 1000,
+		printk("%u.%03u : post-sleep %s flag = %d\n", now_ms / 1000U, now_ms % 1000,
 		       self_suspend ? "SUSPENDING" : "",
 		       dummy_flg);
 		if (self_suspend) {
